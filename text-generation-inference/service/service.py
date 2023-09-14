@@ -38,7 +38,8 @@ class TextGenerationService:
     ):
         self.model = BLoraCausalLM(
             base_model_id=base_model_id,
-            lora_ids=lora_ids
+            lora_ids=lora_ids,
+            blinear_type="bmm",
         )
         self.cache = BatchCache()
 

@@ -6,7 +6,8 @@ from router import TextGenerationRouter, batching_task
 from utils import GenerateRequestInputs, GenerateRequestOutputs, GenerateRequest
 
 base_model_id = "decapoda-research/llama-7b-hf"
-lora_ids = ["jondurbin/airoboros-7b-gpt4-1.2-peft", "trl-lib/llama-7b-se-rl-peft", 'winddude/wizardLM-LlaMA-LoRA-7B']
+# lora_ids = ["jondurbin/airoboros-7b-gpt4-1.2-peft", "trl-lib/llama-7b-se-rl-peft", 'winddude/wizardLM-LlaMA-LoRA-7B']
+lora_ids = ["trl-lib/llama-7b-se-rl-peft", 'winddude/wizardLM-LlaMA-LoRA-7B']
 
 artifacts = {}
 

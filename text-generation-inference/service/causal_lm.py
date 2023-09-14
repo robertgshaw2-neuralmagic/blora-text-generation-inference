@@ -452,7 +452,7 @@ class BLoraCausalLM:
         lora_ids: List[str],
         has_position_ids: bool = True,
         dtype: torch.dtype = torch.float16,
-        blinear_type: Optional[str] = None,
+        blinear_type: Optional[str] = "bmm",
     ):
         self.active_batch_id = None
         self.blinear_type = blinear_type
