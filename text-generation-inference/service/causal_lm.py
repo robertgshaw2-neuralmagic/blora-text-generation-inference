@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, LlamaTokenizer
 
-from utils import Request, Batch, CachedBatch, Generation, StoppingCriteria, NextTokenChooser
+from utils import Request, Batch, CachedBatch, Generation
+from tokens import StoppingCriteria, NextTokenChooser
 from service.blora_utils import load_loras
 
 MAX_TRUNCATION = 256
@@ -25,7 +26,11 @@ class BLoraCausalLMBatch:
     position_ids: torch.Tensor
     past_key_values: Optional[List[Tuple]]
 
+    # all tokens
+    all_input_ids: List[torch.Tensor]
+
     # generation helpers
+    next_token_choosers: List[NextTokenChooser]
     stopping_criterias: List[StoppingCriteria]
 
     # padding metadata
@@ -58,6 +63,7 @@ class BLoraCausalLMBatch:
         requests_idx_mapping = {}
         lora_ids = []
         inputs = []
+        next_token_choosers = []
         stopping_criterias = []
         padding_right_offset = 0
 
@@ -65,7 +71,18 @@ class BLoraCausalLMBatch:
             requests_idx_mapping[r.id] = idx
             lora_ids.append(r.lora_id)
             inputs.append(r.inputs)
-            
+
+            next_token_choosers.append(NextTokenChooser(
+                temperature=r.generate_parameters.temperature,
+                repetition_penalty=r.generate_parameters.repetition_penalty,
+                top_k=r.generate_parameters.top_k,
+                top_p=r.generate_parameters.top_p,
+                typical_p=r.generate_parameters.typical_p,
+                do_sample=r.generate_parameters.do_sample,
+                seed=r.generate_parameters.seed,
+                device=device,
+            ))
+
             max_new_tokens = r.generate_parameters.max_new_tokens
             stopping_criterias.append(StoppingCriteria(
                 eos_token_id=tokenizer.eos_token_id,
@@ -98,6 +115,9 @@ class BLoraCausalLMBatch:
         position_ids = tokenized_inputs["attention_mask"].long().cumsum(-1) - 1
         position_ids.masked_fill_(tokenized_inputs["attention_mask"] == 0, 1)
 
+        # all tokens
+        all_input_ids = tokenized_inputs["input_ids"].T.split(1, dim=1)
+
         return cls(
             batch_id=batch.id,
             requests=batch.requests,
@@ -107,6 +127,8 @@ class BLoraCausalLMBatch:
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
+            all_input_ids=list(all_input_ids),
+            next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
             input_lengths=input_lengths.tolist(),
             max_input_length=max_input_length.item(),
@@ -145,8 +167,10 @@ class BLoraCausalLMBatch:
         new_requests = []
         new_lora_ids = []
         new_requests_idx_mapping = {}
+        new_all_input_ids = []
 
         # generation helpers
+        new_next_token_choosers = []
         new_stopping_criterias = []
         
         # padding metadata
@@ -167,8 +191,10 @@ class BLoraCausalLMBatch:
             new_requests.append(self.requests[old_idx])
             new_requests_idx_mapping[request_id] = new_idx
             new_lora_ids.append(self.lora_ids[old_idx])
+            new_all_input_ids.append(self.all_input_ids[old_idx])
 
             # b) new genertation helpers
+            new_next_token_choosers.append(self.next_token_choosers[old_idx])
             new_stopping_criterias.append(self.stopping_criterias[old_idx])
             
             # c) new padding metadata
@@ -265,6 +291,7 @@ class BLoraCausalLMBatch:
         self.requests = new_requests
         self.requests_idx_mapping = new_requests_idx_mapping
         self.lora_ids = new_lora_ids
+        self.all_input_ids = new_all_input_ids
 
         # model inputs
         self.input_ids = input_ids
@@ -273,6 +300,7 @@ class BLoraCausalLMBatch:
         # self.past_key_values (updated in place)
         
         # generation helpers
+        self.next_token_choosers = new_next_token_choosers
         self.stopping_criterias = new_stopping_criterias
 
         # padding metadata
@@ -301,6 +329,7 @@ class BLoraCausalLMBatch:
         requests = []
         requests_idx_mapping = {}
         lora_ids = []
+        all_input_ids = []
 
         # model inputs
         input_ids = None
@@ -309,18 +338,21 @@ class BLoraCausalLMBatch:
         past_key_values = []
 
         # generation helpers
+        next_token_choosers = []
         stopping_criterias = []
         
         # padding metadata
         input_lengths = []
         
         start_index = 0
-        for i, batch in enumerate(batches):
+        for batch in batches:
             end_index = start_index + len(batch)
 
             # combine all lists
             requests.extend(batch.requests)
             lora_ids.extend(batch.lora_ids)
+            all_input_ids.extend(batch.all_input_ids)
+            next_token_choosers.extend(batch.next_token_choosers)
             stopping_criterias.extend(batch.stopping_criterias)
             input_lengths.extend(batch.input_lengths)        
             
@@ -382,9 +414,9 @@ class BLoraCausalLMBatch:
                 batch.past_key_values = [list(layer) for layer in batch.past_key_values]
                 if len(batch.past_key_values[0][0].shape) != 4:
                     raise NotImplementedError("Only supporting models with past_key_values shape == 4 - i.e. not BLOOM")
-            else:
-                # TODO: I think this might be okay
-                raise ValueError("Currently only supporting tuple types for past_key_values")
+            # else:
+            #     # TODO: I think this might be okay
+            #     raise ValueError("Currently only supporting tuple types for past_key_values")
 
             start_index = end_index    
         
@@ -439,6 +471,8 @@ class BLoraCausalLMBatch:
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            all_input_ids=all_input_ids,
+            next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
             input_lengths=input_lengths,
             max_input_length=max_input_length,
@@ -525,13 +559,6 @@ class BLoraCausalLM:
         outputs = self.model.forward(**kwargs)
         return outputs.logits, outputs.past_key_values
 
-    def greedy(
-        self,
-        logits
-    ):
-        assert(len(logits.shape) == 2)
-        return logits[-1,:].argmax()        
-
     def generate_token(
         self,
         batch: BLoraCausalLMBatch,
@@ -559,27 +586,35 @@ class BLoraCausalLM:
         #   a) sample, b) check stopping criteria, c) create generation, d) update batch
         iterator = zip(
             batch.requests, 
-            batch.input_lengths, 
+            batch.input_lengths,
+            batch.next_token_choosers,
             batch.stopping_criterias,
+            batch.all_input_ids,
             logits,
         )
         for i, (
             request, 
             input_length,
+            next_token_chooser,
             stopping_criteria,
+            all_input_ids,
             logits,
         ) in enumerate(iterator):
             
             # (a) sample
-            next_token_id = self.greedy(logits)
+            next_token_id, log_probs = next_token_chooser(
+                all_input_ids.view(1,-1),
+                logits[-1:,:]
+            )
             new_input_length = input_length + 1
+            all_input_ids = torch.cat([all_input_ids, next_token_id])
 
             # (b) check stopping
             stop, finish_reason = stopping_criteria(token_id=next_token_id)
             if not stop:
                 all_stopped = False
             else:
-                
+                # batch changed, need to update lora weights
                 self.unset_batch_lora_ids()
   
             # c) make generation
