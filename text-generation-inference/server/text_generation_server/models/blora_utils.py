@@ -1877,7 +1877,6 @@ class BLinearBMM(Linear):
             assert self.lora_A[lora_id].weight.dtype == self.weight.dtype
 
         # create the tensors [lora_b, W]
-        
         self.lora_A_weights = torch.stack([self.lora_A[lora_id].weight.T for lora_id in self.batch_lora_ids]).to(self.weight.device)
         self.lora_B_weights = torch.stack([self.lora_B[lora_id].weight.T for lora_id in self.batch_lora_ids]).to(self.weight.device)
         self.scales = torch.tensor([self.scaling[lora_id] for lora_id in self.batch_lora_ids]).reshape(-1,1,1).to(self.weight.device)
