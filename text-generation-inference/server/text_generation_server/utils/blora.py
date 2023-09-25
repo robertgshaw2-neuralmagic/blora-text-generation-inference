@@ -5,7 +5,7 @@ from text_generation_server.utils.layers import (
     TensorParallelRowLinear
 )
 from text_generation_server.utils import Weights
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 class BLoraConfig:
     def __init__(
@@ -27,15 +27,15 @@ class BLoraLinear(torch.nn.Module):
         self.r = r
         self.target_modules = target_modules
 
+        self.cu_seqlen_prefill = None
+
         # adapter weights
         self.lora_ids = {target_module: set() for target_module in self.target_modules}
-        self.scales = {target_module: {} for target_module in self.target_modules}
         self.lora_A = {target_module: {} for target_module in self.target_modules}
         self.lora_B = {target_module: {} for target_module in self.target_modules}
 
         # adapter weights in batch format
         self.batch_lora_ids = {target_module: [] for target_module in self.target_modules}
-        self.scales_batch = {target_module: None for target_module in self.target_modules}
         self.lora_A_batch = {target_module: None for target_module in self.target_modules}
         self.lora_B_batch = {target_module: None for target_module in self.target_modules}
 
@@ -45,6 +45,9 @@ class BLoraLinear(torch.nn.Module):
         lora_alpha: int, 
         weights: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
     ):
+        if lora_alpha != self.r:
+            raise NotImplementedError("Currently not supporting scales")
+        
         # confirm adapters passed are all Wq,Wk,Wv
         if len(weights) != len(self.target_modules):
             raise NotImplementedError("Currently require adapter for all of sub-matrices")
@@ -57,11 +60,21 @@ class BLoraLinear(torch.nn.Module):
                 raise ValueError(f"{lora_id} already loaded into this module")
             
             self.lora_ids[target_module].add(lora_id)
-            self.scales[target_module][lora_id] = lora_alpha / self.r
             self.lora_A[target_module][lora_id] = weights[target_module][0].T
             self.lora_B[target_module][lora_id] = weights[target_module][1].T
     
-    def set_batch_lora_ids(self, lora_ids: List[str]):
+    def set_batch_lora_ids(self, lora_ids: List[str], cu_seqlen_prefill=None):
+        self.cu_seqlen_prefill = cu_seqlen_prefill
+
+        if cu_seqlen_prefill.shape[0] - 1 != len(lora_ids):
+            raise ValueError(
+                f"""
+                cu_seqlen_prefill.shape[0] - 1 must equal len(lora_id)
+                cu_seqlen_prefill.shape[0] = {cu_seqlen_prefill.shape[0]}
+                len(lora_id) = {len(lora_id)}
+                """
+            )
+    
         for target_module in self.target_modules:
             for lora_id in lora_ids:
                 if lora_id not in self.lora_ids[target_module]:
@@ -72,9 +85,8 @@ class BLoraLinear(torch.nn.Module):
         # create the tensors [lora_b, W]
         # TODO: figure out how to get this on the right device in sharded mode
         for target_module in self.target_modules:
-            self.lora_A_batch[target_module] = torch.stack([self.lora_A[target_module][lora_id] for lora_id in self.batch_lora_ids])
-            self.lora_B_batch[target_module] = torch.stack([self.lora_B[target_module][lora_id] for lora_id in self.batch_lora_ids])
-            self.scales_batch[target_module] = torch.tensor([self.scales[target_module][lora_id] for lora_id in self.batch_lora_ids]).reshape(-1,1,1)
+            self.lora_A_batch[target_module] = torch.stack([self.lora_A[target_module][lora_id] for lora_id in self.batch_lora_ids[target_module]])
+            self.lora_B_batch[target_module] = torch.stack([self.lora_B[target_module][lora_id] for lora_id in self.batch_lora_ids[target_module]])
 
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
@@ -82,17 +94,56 @@ class BLoraLinear(torch.nn.Module):
         # xW
         out = self.linear(x)
 
-        # xAB
-        for target_module in enumerate(self.target_modules):
-            if x.shape[0] != len(self.batch_lora_ids[target_module]):
-                raise NotImplementedError("Not yet handling some items in batch not having an adapter")
-            self.lora_forward(out, x)
+        # xAB (decode case)
+        #       reshape x to [batch, 1, model_dim], run BMM
+        if self.cu_seqlen_prefill is None:
+            x = x.view(-1, 1, self.lora_A_batch[target_module].shape[1])
+
+            for target_module in self.target_modules:
+                if x.shape[0] != len(self.batch_lora_ids[target_module]):
+                    raise NotImplementedError("Not yet handling some items in batch not having an adapter")
+                
+                self.lora_forward(out, x, target_module)
+
+        # xAB (prefill case)
+        #       reshape x to batch_size length list of [input_len_i, model_dim]
+        else:
+            # create list of xs and outs for each (jagged shaped) input
+            xs = []
+            outs = []
+            for idx in range(self.cu_seqlen_prefill.shape[0] - 1):
+                start = self.cu_seqlen_prefill[idx]
+                end = self.cu_seqlen_prefill[idx + 1]
+
+                xs.append(x[start:end])
+                outs.append(out[start:end])
+
+            # forward over each module
+            for target_module in self.target_modules:
+                # loop over list
+                for idx, (x_i, out_i) in enumerate(zip(xs, outs)):
+                    self.lora_forward(
+                        out_i,
+                        x_i,
+                        target_module,
+                        idx=idx
+                    )
         
         return out.to(previous_dtype)
     
-    def lora_forward(self, out: torch.Tensor, x: torch.Tensor, target_module: str):
-        out += torch.bmm(torch.bmm(x, self.lora_A_batch[target_module]), self.lora_A_batch[target_module])
+    def lora_forward(
+        self, 
+        out: torch.Tensor, 
+        x: torch.Tensor, 
+        target_module: str, 
+        idx: Optional[int]=None,
+    ):
+        if idx is None:
+            out += torch.bmm(torch.bmm(x, self.lora_A_batch[target_module]), self.lora_B_batch[target_module]).squeeze(dim=1)
+        else:
+            out += torch.mm(torch.mm(x, self.lora_A_batch[target_module][idx]), self.lora_B_batch[target_module][idx])
 
+# TODO: we can get rid of this ---> shouldn't 
 class BLoraLinearQKV(BLoraLinear):
     def __init__(self, linear, r, target_modules=["q_proj", "k_proj", "v_proj"]) -> None:
         super().__init__(linear, r, target_modules)
@@ -101,15 +152,25 @@ class BLoraLinearQKV(BLoraLinear):
         combined_width = self.linear.weight.shape[0]
         if combined_width != 4096 * 3:
             raise NotImplementedError("Currently requires all Wq, Wk, Wk to be the same size")
+        
         width = combined_width // 3
         self.start_out_indexes = {target_module: idx * width for idx, target_module in enumerate(self.target_modules)}
         self.end_out_indexes = {target_module: (idx + 1) * width for idx, target_module in enumerate(self.target_modules)}
 
-    def lora_forward(self, out: torch.Tensor, x: torch.Tensor, target_module: str):
+    def lora_forward(
+        self, 
+        out: torch.Tensor, 
+        x: torch.Tensor, 
+        target_module: str, 
+        idx: Optional[int]=None,
+    ):
         start = self.start_out_indexes[target_module]
         end = self.end_out_indexes[target_module]
-        
-        out[:, start: end] += torch.bmm(torch.bmm(x, self.lora_A_batch[target_module]), self.lora_A_batch[target_module])
+
+        if idx is None:
+            out[:, start:end] += torch.bmm(torch.bmm(x, self.lora_A_batch[target_module]), self.lora_B_batch[target_module]).squeeze(dim=1)
+        else:
+            out[:, start:end] += torch.mm(torch.mm(x, self.lora_A_batch[target_module][idx]), self.lora_B_batch[target_module][idx])
 
 class BLoraTensorParallelColumnLinear(SuperLayer):
     def __init__(self, linear):

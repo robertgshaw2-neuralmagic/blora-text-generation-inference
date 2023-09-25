@@ -18,7 +18,6 @@ from text_generation_server.utils import (
 
 tracer = trace.get_tracer(__name__)
 
-
 class FlashLlama(FlashCausalLM):
     def __init__(
         self,
