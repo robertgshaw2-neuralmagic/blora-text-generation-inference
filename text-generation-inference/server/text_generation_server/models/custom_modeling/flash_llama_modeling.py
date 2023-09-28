@@ -232,7 +232,9 @@ class FlashLlamaAttention(torch.nn.Module):
         slots,
         input_lengths,
         max_s,
-    ):
+    ):  
+        # self.hidden_states = hidden_states
+
         qkv = self.query_key_value(hidden_states)
         query, kv = qkv.split(
             [

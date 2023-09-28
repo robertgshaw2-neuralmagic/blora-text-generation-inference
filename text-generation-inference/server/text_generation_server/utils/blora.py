@@ -145,17 +145,30 @@ class BLoraLinear(torch.nn.Module):
 
 # TODO: we can get rid of this ---> shouldn't 
 class BLoraLinearQKV(BLoraLinear):
-    def __init__(self, linear, r, target_modules=["q_proj", "k_proj", "v_proj"]) -> None:
-        super().__init__(linear, r, target_modules)
-
-        # get endpoints of Wq, Wk, Wv
-        combined_width = self.linear.weight.shape[0]
-        if combined_width != 4096 * 3:
-            raise NotImplementedError("Currently requires all Wq, Wk, Wk to be the same size")
+    def __init__(
+        self, 
+        linear, 
+        r,
+        target_modules=["q_proj", "k_proj", "v_proj"],
+        target_output_widths={"q_proj": 4096, "k_proj":4096, "v_proj":4096},
+    ) -> None:
         
-        width = combined_width // 3
-        self.start_out_indexes = {target_module: idx * width for idx, target_module in enumerate(self.target_modules)}
-        self.end_out_indexes = {target_module: (idx + 1) * width for idx, target_module in enumerate(self.target_modules)}
+        super().__init__(linear, r, target_modules)
+        
+        total_width = 0
+        self.start_out_indexes = {}
+        self.end_out_indexes = {}
+
+        if len(target_output_widths) != len(target_modules):
+            raise ValueError("number of target output widths passed must equal number of target_modules")
+        
+        for target, target_output_width in target_output_widths.items():
+            if target not in target_modules:
+                raise ValueError("All target output width keys must be in target modules")
+
+            self.start_out_indexes[target] = total_width
+            total_width += target_output_width
+            self.end_out_indexes[target] = total_width
 
     def lora_forward(
         self, 
@@ -184,12 +197,14 @@ class BLoraTensorParallelColumnLinear(SuperLayer):
         lora_r: int,
         lora_configs: List[BLoraConfig],
         target_modules: List[str],
+        target_output_widths: Dict[str, int],
     ):
         # SETUP WRAPPER
         blora_linear = BLoraLinearQKV(
             linear=linear.linear,
             r=lora_r,
-            target_modules=target_modules
+            target_modules=target_modules,
+            target_output_widths=target_output_widths,
         )
 
         # LOAD WEIGHTS INTO MEMORY
